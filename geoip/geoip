@@ -1,0 +1,132 @@
+#!/usr/bin/python
+# (c) lovemonkey257, 2005-2015
+
+from __future__ import print_function
+import GeoIP
+import re
+import sys
+import argparse
+import urllib
+import json
+import os.path
+
+parser = argparse.ArgumentParser(description='Geolocate IP addresses. Uses Maxmind datasets')
+parser.add_argument('--geoipdb', help='Base dir for GeoIP databases', default='/usr/local/share/geoip')
+parser.add_argument('--asn', help='ASN only', action='store_true')
+parser.add_argument('--city', help='City only', action='store_true')
+parser.add_argument('--country', help='Country only', action='store_true')
+parser.add_argument('--loc', help='Location only', action='store_true')
+parser.add_argument('--brief', help='Brief output', action='store_true')
+parser.add_argument('--json', help='JSON output', action='store_true')
+parser.add_argument('--all', help='Show all IPs resolved or not', action='store_true',default=False)
+parser.add_argument('--torupdate', help='Update TOR exit node list', action='store_true')
+parser.add_argument('--ip', help='IP address')
+parser.add_argument('--separator', help='Separator for fields. Defaults to tab', default="\t")
+parser.add_argument('--append', help='Append to line', action="store_true")
+parser.add_argument('--noip', help='Dont display IP. Use with --append', action="store_true")
+g_args = parser.parse_args()
+
+# Set up some globals
+# Tor IP lookup and file
+g_tor_en_lookup = dict()
+g_tor_en_list_fn = os.path.abspath(g_args.geoipdb + "/tor-exit-node-list.csv")
+
+# Separator to use for output
+g_output_separator=str(g_args.separator.decode('string-escape'))
+
+if g_args.torupdate:
+    # TOR Exit nodes: http://torstatus.blutmagie.de/ip_list_exit.php/Tor_ip_list_EXIT.csv
+    # All TOR nodes:  https://torstatus.blutmagie.de/ip_list_all.php/Tor_ip_list_ALL.csv 
+    try:
+        # url = urllib.urlretrieve("http://torstatus.blutmagie.de/ip_list_exit.php/Tor_ip_list_EXIT.csv" , g_tor_en_list_fn )
+        url = urllib.urlretrieve("https://torstatus.blutmagie.de/ip_list_all.php/Tor_ip_list_ALL.csv" , g_tor_en_list_fn )
+    except:
+        print("Cannot get or save the list. Check site and permissions")
+    else:
+        print("Tor list updated")
+    exit()
+
+try:
+    g_ipdb  = GeoIP.open(os.path.abspath(g_args.geoipdb + "/GeoLiteCity.dat"), GeoIP.GEOIP_STANDARD)
+    g_asndb = GeoIP.open(os.path.abspath(g_args.geoipdb + "/GeoIPASNum.dat"), GeoIP.GEOIP_STANDARD)
+except:
+    print("Please ensure you have the GeoCity and GeoIPASN databases on your system")
+    exit()
+
+def get_tor_exit_node_list():
+    try:
+    	for l in open(g_tor_en_list_fn):
+        	g_tor_en_lookup[l.replace("\n","")]=1
+    except:
+	print("Check TOR exit list file, ",g_tor_en_list_fn,", exists and you can read it")
+	raise
+
+def process_ip_list(line,m):
+    for ip in m:
+        asnrec = g_asndb.name_by_addr(ip)
+        iprec  = g_ipdb.record_by_addr(ip)
+        tor    = "-"
+
+        if ip in g_tor_en_lookup:
+            tor="TOR"
+        if iprec is not None and asnrec is not None:
+            iprec["ip"]=ip
+            iprec["ASN"]=asnrec
+            if iprec['city'] is None:
+                iprec['city']=""
+            if iprec['country_code'] is None:
+                iprec['country_code']=""
+
+            if g_args.json:
+                print(json.dumps(iprec,ensure_ascii=False))
+            else:
+                flds=[]
+                if not g_args.noip:
+                    flds.append(ip)
+                if g_args.append and not g_args.json and g_args.ip is None:
+                    sys.stdout.write(line.rstrip() + sep)
+                if g_args.asn:
+                    flds.append(asnrec)
+                elif g_args.city:
+                    flds.append(iprec['city'])
+                elif g_args.country:
+                    flds.append(iprec['country_code'])
+                elif g_args.loc:
+                    flds.append(iprec['country_code'])
+                    flds.append(iprec['city'])
+                    flds.append(str(iprec['latitude']))
+                    flds.append(str(iprec['longitude']))
+                elif g_args.brief:
+                    flds.append(tor)
+                    flds.append(iprec['country_code'])
+                    flds.append(iprec['ASN'])
+                else:
+                    flds.append(tor)
+                    flds.append(iprec['country_code'])
+                    flds.append(iprec['city'])
+                    flds.append(iprec['ASN'])
+                    flds.append(str(iprec['latitude']))
+                    flds.append(str(iprec['longitude']))
+                print(g_output_separator.join(flds))
+        else:
+            if g_args.all:
+                print(g_output_separator.join([ip,'?']) )
+
+# Regex for IPv4 addrs
+ipre = re.compile('(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})', re.IGNORECASE)
+
+# Create our Tor exit IP lookup
+get_tor_exit_node_list()
+
+# Get ips from stdin or cmd line?
+if g_args.ip is not None:
+    m = ipre.findall(g_args.ip)
+    process_ip_list("", m)
+else:
+    for line in sys.stdin:
+        m = ipre.findall(line)
+        if m is None: 
+            continue
+        process_ip_list(line,m)
+
+exit()
