@@ -6,4 +6,5 @@ Set of tools used for DFIR. Do not assume this is a coherent set of tools but it
 Tools:
 - geoip
 - bro-to-json.pl
+- json-to-elastic
 
