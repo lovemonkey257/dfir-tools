@@ -1,0 +1,128 @@
+#! /usr/bin/perl -w
+
+use strict;
+use JSON;
+use Data::Dumper;
+use Getopt::Long;
+
+sub usage() {
+    print <<USAGE
+brolog-to-json [-pp|-sensor=<sensor>]
+
+	--pp        Pretty print output - use this for testing
+        --sensor=X  Add a "sensor" field to track "where" these logs are from (ie network visibility). It can be anything you like
+
+Takes BRO IDS logs on stdin and converts to JSON (primarily aimed at ElasticSearch). The conversion is naive in that it takes 
+each column heading and uses that as the key. It also normalised the IP and Port fields. Many systems (and my brain) doesn't 
+like the "id.orig*" and "id.resp*" (although I understand the reasons) so if you parsing BRO logs into ElasticSearch, for example, 
+and you put in Snort logs and logs from other systems, in my experience the Src IP etc fields will be called just that
+src_ip, src_port etc. This script will rename IP and port fields as follows:
+
+	id.orig_h  - src_ip
+        id.orig_p  - src_port
+        id.resp_h  - dst_ip
+        id.resp_p  - dst_port
+
+A "_type" field is added which matches the type of log e.g. conn, dhcp etc
+
+USAGE
+}
+
+my $separator="\t";
+my $empty_field="";
+my $unset_field="-";
+my $type       = "-";
+my %field_names;     # key = field name, value = field type
+my %field_names_pos; # key = column position , value = field name
+my %field_values;    # key = field name, value = value from file
+my $jsonpp = 0;
+my $sensor = "unknown";
+
+my $help;
+GetOptions (
+    "pp"        => \$jsonpp ,
+    "sensor"    => \$sensor,
+    "help"      => \$help
+);
+if ($help) {
+	usage();
+	exit(1);
+}
+
+my $json = JSON->new->allow_nonref;
+
+while (<>) {
+    chomp;
+    if (/^#separator (.*)/) {
+        $separator=$1;
+    } elsif (/^#empty_field\s+(.*)/) {
+        $empty_field=$1;
+    } elsif (/^#unset_field\s+(.*)/) {
+        $unset_field=$1;
+    } elsif (/^#path\s+(.*)/) {
+	# Use path as basis of type, and prefix it with bro to make it unique-ish
+        $type="bro-".$1;
+    } elsif (/^#fields\s+(.*)$/) {
+	# Create inverted hash on field position and its name: key= position, value=name of field
+        my $pos=0;
+        my $flds=$1;
+        foreach my $f (split(/$separator/,$flds)) {
+            # rename  id.orig_h id.orig_p id.resp_h id.resp_p 
+            $f="src_ip" if $f eq "id.orig_h";
+            $f="dst_ip" if $f eq "id.resp_h";
+            $f="src_port" if $f eq "id.orig_p";
+            $f="dst_port" if $f eq "id.resp_p";
+            $field_names_pos{$pos}=$f;
+            $pos++;
+        }
+    } elsif (/^#types\s+(.*)/) {
+	# Create the field look up hash where key=field name, value=type
+        my $pos=0;
+        foreach my $f (split(/$separator/,$1)) {
+           $field_names{$field_names_pos{$pos}}=$f;
+           $pos++; 
+        }
+    } elsif (!/^#/) {
+        # Data
+        my $pos=0;
+        foreach my $d (split(/$separator/)) {
+
+	   my $field_type=$field_names{$field_names_pos{$pos}};
+           my $field_name=$field_names_pos{$pos};
+
+           # Bro has a nasty habit of setting things to dash, then to a number - plays havoc with ElasticSearch auto-typing
+           # Here we set it to something suitable and match types so JSON is output with correct type
+           if ( $d eq $unset_field or $d eq $empty_field) {
+                # types:  time (float) ,string, addr, port (int), vector, count (int)
+                if ( $field_type =~ /^(time|port|count|interval)/ ) {
+                    $d=0
+                } else {
+                    $d=""
+                }
+           } else {
+		# Handle vector types and make sure JSON outputs arrays
+		if ($field_type =~ /^vector\[(.+)\]/) {
+			my $v_type=$1;
+			my @v=split(/,/,$d);
+			for(my $p=0;$p<scalar(@v);$p++) {
+				$v[$p]=$v[$p]*1   if $v_type =~/^(port|count)/ ;
+				$v[$p]=$v[$p]*1.0 if $v_type =~/^(time|interval)/;
+			}
+			$field_values{$field_name}=\@v;
+		} else {
+			$d*=1   if $field_type =~/^(port|count)/ ;
+			$d*=1.0 if $field_type =~/^(time|interval)/;
+           		$field_values{$field_name}=$d; 
+		}
+	   }
+           $pos++; 
+        }
+        $field_values{"_type"}  = $type;
+        $field_values{"sensor"} = $sensor;
+        if ($jsonpp) {
+            print $json->pretty->encode(\%field_values);
+        } else {
+            print $json->encode(\%field_values) . "\n";
+        }
+    }
+}
