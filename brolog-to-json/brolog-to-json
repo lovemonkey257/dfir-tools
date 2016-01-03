@@ -29,6 +29,7 @@ USAGE
 }
 
 my $separator="\t";
+my $set_separator=",";
 my $empty_field="";
 my $unset_field="-";
 my $type       = "-";
@@ -36,33 +37,63 @@ my %field_names;     # key = field name, value = field type
 my %field_names_pos; # key = column position , value = field name
 my %field_values;    # key = field name, value = value from file
 my $jsonpp = 0;
+my $genlogstashconf = 0;
+my $filter_fname = "filter.conf";
+my $template_fname = "template.conf";
 my $sensor = "unknown";
+my $logname = "";
+
+my $FILTER_HDL;
+my $TEMPLATE_HDL;
 
 my $help;
 GetOptions (
-    "pp"        => \$jsonpp ,
-    "sensor"    => \$sensor,
-    "help"      => \$help
+    "pp"         => \$jsonpp ,
+    "logstash"   => \$genlogstashconf ,
+    "sensor"     => \$sensor,
+    "filter=s"   => \$filter_fname,
+    "template=s" => \$template_fname,
+    "help"       => \$help
 );
 if ($help) {
 	usage();
 	exit(1);
 }
-
 my $json = JSON->new->allow_nonref;
 
-while (<>) {
+#separator \x09
+#set_separator  ,
+#empty_field    (empty)
+#unset_field    -
+#path   conn
+#open   2015-12-04-16-32-52
+#fields ts      uid     id.orig_h       id.orig_p       id.resp_h       id.resp_p       proto   service duration        orig_bytes      resp_bytes      conn_state    local_orig      local_resp      missed_bytes    history orig_pkts       orig_ip_bytes   resp_pkts       resp_ip_bytes   tunnel_parents
+#types  time    string  addr    port    addr    port    enum    string  interval        count   count   string  bool    bool    count   string  count   countcount    count   set[string]
+
+LINE: while (<>) {
     chomp;
-    if (/^#separator (.*)/) {
+
+    if (/^#separator\s+(.+?)$/) {
         $separator=$1;
-    } elsif (/^#empty_field\s+(.*)/) {
+
+    } elsif (/^#set_separator\s+(.+?)$/) {
+        $set_separator=$1;
+
+    } elsif (/^#empty_field\s+(.+?)$/) {
         $empty_field=$1;
-    } elsif (/^#unset_field\s+(.*)/) {
+
+    } elsif (/^#unset_field\s+(.+?)$/) {
         $unset_field=$1;
-    } elsif (/^#path\s+(.*)/) {
+
+    } elsif (/^#path\s+(.+?)$/) {
 	# Use path as basis of type, and prefix it with bro to make it unique-ish
-        $type="bro-".$1;
-    } elsif (/^#fields\s+(.*)$/) {
+        $logname=$1;
+        $type="bro-".$logname;
+
+    } elsif (/^#open\s+/) {
+        next;        
+
+    } elsif (/^#fields\s+(.+?)$/) {
 	# Create inverted hash on field position and its name: key= position, value=name of field
         my $pos=0;
         my $flds=$1;
@@ -75,13 +106,222 @@ while (<>) {
             $field_names_pos{$pos}=$f;
             $pos++;
         }
-    } elsif (/^#types\s+(.*)/) {
+
+    } elsif (/^#types\s+(.+?)$/) {
 	# Create the field look up hash where key=field name, value=type
         my $pos=0;
         foreach my $f (split(/$separator/,$1)) {
            $field_names{$field_names_pos{$pos}}=$f;
            $pos++; 
         }
+
+    } elsif ($genlogstashconf) {
+
+        open($FILTER_HDL,">",$filter_fname) or die "Cannot create $filter_fname";
+        open($TEMPLATE_HDL,">",$template_fname) or die "Cannot create $template_fname";
+        
+        my @f;
+        foreach my $p (sort { $a <=> $b } keys %field_names_pos) {
+            my $fname=$field_names_pos{$p};
+            $fname=~s/\./_/g;
+            push(@f,$fname)
+        }
+        my $field_list = join(",", map {"\"".$_."\""} @f );
+
+        # for each type we can generate a convert list
+        # T/F will convert to boolean
+        # bro float to float
+        # bro int to integer
+        # string/vector to string
+
+        if ($type eq "bro-conn") {
+          print $FILTER_HDL <<__F1__;
+filter {
+            # Conn specific 
+            if [type] == "bro-conn" {
+              csv {
+                  separator => "\t"
+                  columns => [ $field_list ]
+              }
+              translate {
+                field => "conn_state"
+                destination => "conn_state_desc"
+                dictionary => [
+                  "S0", "Connection attempt seen, no reply",
+                  "S1", "Connection established, not terminated",
+                  "S2", "Connection established and close attempt by originator seen (but no reply from responder)",
+                  "S3", "Connection established and close attempt by responder seen (but no reply from originator)",
+                  "SF", "Normal SYN/FIN completion",
+                  "REJ", "Connection attempt rejected",
+                  "RSTO", "Connection established, originator aborted (sent a RST)",
+                  "RSTR", "Established, responder aborted",
+                  "RSTOS0", "Originator sent a SYN followed by a RST, we never saw a SYN-ACK from the responder",
+                  "RSTRH", "Responder sent a SYN ACK followed by a RST, we never saw a SYN from the (purported) originator",
+                  "SH", "Originator sent a SYN followed by a FIN, we never saw a SYN ACK from the responder (hence the connection was 'half' open)",
+                  "SHR", "Responder sent a SYN ACK followed by a FIN, we never saw a SYN from the originator",
+                  "OTH", "No SYN seen, just midstream traffic (a 'partial connection' that was not later closed)"
+                ]
+              }
+              mutate {
+                convert => [ "orig_bytes", "integer" ]
+                convert => [ "duration", "float" ]
+                convert => [ "resp_bytes", "integer" ]
+                convert => [ "missed_bytes", "integer" ]
+                convert => [ "orig_pkts", "integer" ]
+                convert => [ "orig_ip_bytes", "integer" ]
+                convert => [ "resp_pkts", "integer" ]
+                convert => [ "resp_ip_bytes", "integer" ]
+                convert => [ "local_orig", "boolean" ]
+                convert => [ "local_resp", "boolean" ]
+              }
+            }
+}
+__F1__
+        }
+        if ($type eq "bro-dns") {
+          print $FILTER_HDL <<__F2__;
+filter {
+            # DNS
+            if [type] == "bro-dns" {
+              csv {
+                  separator => "\t"
+                  columns => [ $field_list ]
+              }
+              mutate {
+                lowercase => [ "query" ]
+                convert => [ "rcode", "integer" ]
+                convert => [ "qtype", "integer" ]
+                convert => [ "qclass", "integer" ]
+                convert => [ "trans_id", "integer" ]
+                convert => [ "AA", "boolean" ]
+                convert => [ "TC", "boolean" ]
+                convert => [ "RD", "boolean" ]
+                convert => [ "RA", "boolean" ]
+              }
+            }
+}
+__F2__
+        }
+        if ($type eq "bro-ssl") {
+          print $FILTER_HDL <<__F3__;  
+filter {  
+            # SSL
+            if [type] == "bro-ssl" {
+              csv {
+                  separator => "\t"
+                  columns => [ $field_list ]
+              }
+              mutate {
+                convert => [ "resumed", "boolean" ]
+                convert => [ "established", "boolean" ]
+              }
+            }
+}
+__F3__
+        }
+        if ($type eq "bro-http") {
+          print $FILTER_HDL <<__F4__;    
+ filter {
+            # HTTP
+            if [type] == "bro-http" {
+              csv {
+                  separator => "\t"
+                  columns => [ $field_list ]
+              }
+              mutate {
+                convert => [ "trans_depth", "integer" ]
+                convert => [ "request_body_len", "integer" ]
+                convert => [ "response_body_len", "integer" ]
+                convert => [ "status_code", "integer" ]
+                convert => [ "info_code", "integer"]
+              }
+              if [proxied] == "-" {
+                mutate { add_field => [ "proxy", false ] }
+              } else {
+                mutate { add_field => [ "proxy", true ] }
+              }
+            }
+}
+__F4__
+        }
+        if ($type eq "bro-x509") {
+          print $FILTER_HDL <<__F5__;  
+filter {  
+            # x509
+            if [type] == "bro-x509" {
+              csv {
+                  separator => "\t"
+                  columns => [ $field_list ]
+              }
+              mutate {
+                convert => [ "certificate_version", "integer" ]
+                convert => [ "certificate_key_length", "integer" ]
+                convert => [ "certificate_exponent", "integer" ]
+                convert => [ "certificate_not_valid_before", "float" ]
+                convert => [ "certificate_not_valid_after", "float" ]
+                convert => [ "basic_constraints_ca", "boolean" ]
+              }
+            }
+}
+__F5__
+        }
+        if ($type eq "bro-smtp") {
+          print $FILTER_HDL <<__F6__; 
+filter {   
+            # SMTP
+            if [type] == "bro-smtp" {
+              csv {
+                  separator => "\t"
+                  columns => [ $field_list ]
+              }
+              mutate {
+                convert => [ "trans_depth", "integer" ]
+                convert => [ "tls", "boolean" ]
+                convert => [ "is_webmail", "boolean" ]
+              }
+            }
+}
+__F6__
+        }
+        if ($type eq "bro-software") {
+          print $FILTER_HDL <<__F7__; 
+filter {   
+            # Software
+            if [type] == "bro-software" {
+              csv {
+                  separator => "\t"
+                  columns => [ $field_list ]
+              }
+              mutate {
+                convert => [ "version_major", "integer" ]
+                convert => [ "version_minor", "integer" ]
+                convert => [ "version_minor2", "integer" ]
+                convert => [ "version_minor3", "integer" ]
+              }
+            }
+}
+__F7__
+        }
+        if ($type eq "bro-known_services") {
+          print $FILTER_HDL <<__F8__;
+ filter {
+            # Known Services
+            if [type] == "bro-known_services" {
+              csv {
+                  separator => "\t"
+                  columns => [ $field_list ]
+              }
+              mutate {
+                convert => [ "port_num", "integer" ]
+              }
+            }
+}
+__F8__
+        }
+        close($FILTER_HDL);
+        close($TEMPLATE_HDL);
+        last LINE;
+
     } elsif (!/^#/) {
         # Data
         my $pos=0;
@@ -100,21 +340,22 @@ while (<>) {
                     $d=""
                 }
            } else {
-		# Handle vector types and make sure JSON outputs arrays
-		if ($field_type =~ /^vector\[(.+)\]/) {
-			my $v_type=$1;
-			my @v=split(/,/,$d);
-			for(my $p=0;$p<scalar(@v);$p++) {
-				$v[$p]=$v[$p]*1   if $v_type =~/^(port|count)/ ;
-				$v[$p]=$v[$p]*1.0 if $v_type =~/^(time|interval)/;
-			}
-			$field_values{$field_name}=\@v;
-		} else {
-			$d*=1   if $field_type =~/^(port|count)/ ;
-			$d*=1.0 if $field_type =~/^(time|interval)/;
-           		$field_values{$field_name}=$d; 
-		}
-	   }
+    	       # Handle vector types and make sure JSON outputs arrays
+        	   if ($field_type =~ /^vector\[(.+)\]/) {
+        	        my $v_type=$1;
+        	        my @v=split(/$set_separator/,$d);
+        		    for(my $p=0;$p<scalar(@v);$p++) {
+					# convert types
+        				$v[$p]=$v[$p]*1   if $v_type =~/^(port|count)/ ;
+        				$v[$p]=$v[$p]*1.0 if $v_type =~/^(time|interval)/;
+        			}
+        			$field_values{$field_name}=\@v;
+        		} else {
+        			$d*=1   if $field_type =~/^(port|count)/ ;
+        			$d*=1.0 if $field_type =~/^(time|interval)/;
+                   		$field_values{$field_name}=$d; 
+        		}
+    	   }
            $pos++; 
         }
         $field_values{"_type"}  = $type;
